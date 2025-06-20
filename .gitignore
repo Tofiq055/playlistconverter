@@ -1,0 +1,5 @@
+.env
+client_secret.json
+video_cache.json
+failed_tracks.txt
+__pycache__/
