@@ -1,10 +1,9 @@
+import os
 import json
 import time
-import os
-from dotenv import load_dotenv
-
 from pathlib import Path
 
+from dotenv import load_dotenv
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -13,18 +12,16 @@ from googleapiclient.errors import HttpError
 from fuzzywuzzy import fuzz
 from tqdm import tqdm
 
-# ====== USER CONFIGURATION ======
+# Load environment variables
 load_dotenv()
 SPOTIFY_CLIENT_ID = os.environ.get('SPOTIPY_CLIENT_ID')
 SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIPY_CLIENT_SECRET')
-SPOTIFY_REDIRECT_URI = os.environ.get('SPOTIPY_CLIENT_REDIRECT_URI', os.environ.get('SPOTIPY_REDIRECT_URI'))
+SPOTIFY_REDIRECT_URI = os.environ.get('SPOTIPY_REDIRECT_URI')
 YOUTUBE_CLIENT_SECRET_FILE = 'client_secret.json'
 SPOTIFY_SCOPE = 'playlist-read-private'
 YOUTUBE_SCOPE = ['https://www.googleapis.com/auth/youtube.force-ssl']
-
 CACHE_FILE = 'video_cache.json'
 FAILED_TRACKS_FILE = 'failed_tracks.txt'
-# ================================
 
 def load_cache():
     if Path(CACHE_FILE).exists():
@@ -72,6 +69,20 @@ def get_spotify_tracks(sp, playlist_id):
             results = None
     return playlist_name, tracks
 
+def get_youtube_playlist_by_name(youtube, name):
+    request = youtube.playlists().list(
+        part="snippet",
+        mine=True,
+        maxResults=50
+    )
+    while request is not None:
+        response = request.execute()
+        for item in response['items']:
+            if item['snippet']['title'] == name:
+                return item['id']
+        request = youtube.playlists().list_next(request, response)
+    return None
+
 def create_youtube_playlist(youtube, title):
     request = youtube.playlists().insert(
         part="snippet,status",
@@ -83,6 +94,24 @@ def create_youtube_playlist(youtube, title):
     response = request.execute()
     return response['id']
 
+def get_video_ids_in_playlist(youtube, playlist_id):
+    video_ids = set()
+    nextPageToken = None
+    while True:
+        request = youtube.playlistItems().list(
+            part="snippet",
+            playlistId=playlist_id,
+            maxResults=50,
+            pageToken=nextPageToken
+        )
+        response = request.execute()
+        for item in response['items']:
+            video_ids.add(item['snippet']['resourceId']['videoId'])
+        nextPageToken = response.get('nextPageToken')
+        if not nextPageToken:
+            break
+    return video_ids
+
 def retry(func, *args, **kwargs):
     max_retries = 5
     for attempt in range(max_retries):
@@ -91,7 +120,7 @@ def retry(func, *args, **kwargs):
         except HttpError as e:
             if e.resp.status in [403, 409, 429, 500, 503]:
                 sleep_time = 2 ** attempt
-                print(f"Quota or temporary error (attempt {attempt+1}), retrying in {sleep_time}s...")
+                print(f"Quota/temporary error (attempt {attempt+1}), retrying in {sleep_time}s...")
                 time.sleep(sleep_time)
             else:
                 raise
@@ -104,10 +133,9 @@ def fuzzy_search_youtube(youtube, query, original_title, cache):
         youtube.search().list,
         q=query, part='snippet', type='video', maxResults=5
     ).execute()
-    
+
     best_score = 0
     best_video_id = None
-
     for item in response['items']:
         video_title = item['snippet']['title']
         score = fuzz.token_set_ratio(video_title.lower(), original_title.lower())
@@ -137,19 +165,30 @@ def add_to_youtube_playlist(youtube, playlist_id, video_id):
 def convert_playlist(sp, youtube, spotify_playlist_id, cache):
     playlist_name, tracks = get_spotify_tracks(sp, spotify_playlist_id)
     print(f"\n🎧 Converting: {playlist_name}")
-    yt_playlist_id = create_youtube_playlist(youtube, playlist_name)
+
+    yt_playlist_id = get_youtube_playlist_by_name(youtube, playlist_name)
+    if yt_playlist_id:
+        print(f"Found existing playlist: {playlist_name}")
+    else:
+        yt_playlist_id = create_youtube_playlist(youtube, playlist_name)
+        print(f"Created new playlist: {playlist_name}")
+
+    existing_video_ids = get_video_ids_in_playlist(youtube, yt_playlist_id)
 
     for track in tqdm(tracks, desc=f"Adding to {playlist_name}"):
         video_id = fuzzy_search_youtube(youtube, track, track, cache)
-        if video_id:
-            add_to_youtube_playlist(youtube, yt_playlist_id, video_id)
-        else:
+        if not video_id:
             log_failed_track(track, playlist_name)
             print(f"✗ Not Found: {track}")
+            continue
+        if video_id in existing_video_ids:
+            continue  # Don't add duplicates
+        add_to_youtube_playlist(youtube, yt_playlist_id, video_id)
+        existing_video_ids.add(video_id)
 
 if __name__ == '__main__':
     print("==== Spotify to YouTube Music Playlist Converter ====")
-    print("NOTE: Make sure your credentials and 'client_secret.json' are set up!\n")
+    print("NOTE: Make sure your credentials, '.env', and 'client_secret.json' are set up!\n")
 
     sp = authenticate_spotify()
     youtube = authenticate_youtube()
